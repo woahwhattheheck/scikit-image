@@ -2425,8 +2425,8 @@ class PolynomialTransform(_GeometricTransform):
         indicate, particularly in an overdetermined system, if point pairs have
         higher or lower confidence or uncertainties associated with them. From
         the matrix treatment of least squares problems, these weight values are
-        normalized, square-rooted, then built into a diagonal matrix, by which
-        A is multiplied.
+        normalized and square-rooted, then used to scale the corresponding
+        equations directly.
 
         Parameters
         ----------
@@ -2469,25 +2469,39 @@ class PolynomialTransform(_GeometricTransform):
         order = safe_as_int(order)
         u = (order + 1) * (order + 2)
 
-        A = np.zeros((rows * 2, u + 1))
+        # Both output coordinates share the same polynomial design matrix.
+        # Factor [P, xd, yd] once rather than building the two-output system
+        # at the full number of landmarks. Left multiplication by the same
+        # orthogonal factor in each output block preserves the TLS problem.
+        ncoeff = u // 2
+        design = np.empty((rows, ncoeff + 2))
         pidx = 0
         for j in range(order + 1):
             for i in range(j + 1):
-                A[:rows, pidx] = xs ** (j - i) * ys**i
-                A[rows:, pidx + u // 2] = xs ** (j - i) * ys**i
+                design[:, pidx] = xs ** (j - i) * ys**i
                 pidx += 1
 
-        A[:rows, -1] = xd
-        A[rows:, -1] = yd
+        design[:, -2] = xd
+        design[:, -1] = yd
 
-        # Get the vectors that correspond to singular values, also applying
-        # the weighting if provided
-        if weights is None:
-            _, _, V = np.linalg.svd(A)
-        else:
+        if weights is not None:
             weights = np.asarray(weights)
-            W = np.diag(np.tile(np.sqrt(weights / np.max(weights)), 2))
-            _, _, V = np.linalg.svd(W @ A)
+            design = np.sqrt(weights / np.max(weights))[:, np.newaxis] * design
+
+        if rows > design.shape[1]:
+            # mode='r' avoids computing or retaining the orthogonal factor.
+            design = np.linalg.qr(design, mode='r')
+
+        rows = design.shape[0]
+        A = np.zeros((rows * 2, u + 1), dtype=design.dtype)
+        A[:rows, :ncoeff] = design[:, :ncoeff]
+        A[rows:, ncoeff:u] = design[:, :ncoeff]
+        A[:rows, -1] = design[:, -2]
+        A[rows:, -1] = design[:, -1]
+
+        # Full right singular vectors are needed only for a wide system, to
+        # retain its nullspace. A tall system needs no full left basis.
+        _, _, V = np.linalg.svd(A, full_matrices=A.shape[0] < A.shape[1])
 
         # solution is right singular vector that corresponds to smallest
         # singular value
@@ -2597,8 +2611,8 @@ class PolynomialTransform(_GeometricTransform):
         indicate, particularly in an overdetermined system, if point pairs have
         higher or lower confidence or uncertainties associated with them. From
         the matrix treatment of least squares problems, these weight values are
-        normalized, square-rooted, then built into a diagonal matrix, by which
-        A is multiplied.
+        normalized and square-rooted, then used to scale the corresponding
+        equations directly.
 
         Parameters
         ----------
