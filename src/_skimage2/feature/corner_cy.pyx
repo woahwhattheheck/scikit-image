@@ -5,11 +5,133 @@
 import numpy as np
 cimport numpy as cnp
 from libc.float cimport DBL_MAX
-from libc.math cimport atan2, fabs
+from libc.math cimport atan2, fabs, sqrt, hypot, copysign, cos, acos
 
 from _skimage2._shared.fused_numerics cimport np_floats
 
 cnp.import_array()
+
+
+cdef void _symmetric_3x3_jacobi(
+    double a, double b, double c, double d, double e, double f,
+    double* eigenvalues,
+) noexcept nogil:
+    """Resolve clustered roots without an ill-conditioned cubic formula."""
+    cdef double m[3][3]
+    cdef double largest, delta, tangent, cosine, sine, x, y
+    cdef int iteration, p, q, k
+    m[0][0], m[1][1], m[2][2] = a, b, c
+    m[0][1], m[1][0] = d, d
+    m[1][2], m[2][1] = e, e
+    m[0][2], m[2][0] = f, f
+    # Maximum-pivot Jacobi on a 3 x 3 matrix converges quadratically. Keep a
+    # fixed work bound; 32 rotations comfortably exceeds double precision.
+    for iteration in range(32):
+        p, q = 0, 1
+        largest = fabs(m[0][1])
+        if fabs(m[0][2]) > largest:
+            p, q = 0, 2
+            largest = fabs(m[0][2])
+        if fabs(m[1][2]) > largest:
+            p, q = 1, 2
+            largest = fabs(m[1][2])
+        if largest == 0:
+            break
+        delta = (m[q][q] - m[p][p]) * 0.5
+        if delta == 0:
+            tangent = 1
+        else:
+            tangent = m[p][q] / (delta + copysign(hypot(delta, m[p][q]), delta))
+        cosine = 1 / sqrt(1 + tangent * tangent)
+        sine = tangent * cosine
+        x = tangent * m[p][q]
+        m[p][p] -= x
+        m[q][q] += x
+        m[p][q], m[q][p] = 0, 0
+        for k in range(3):
+            if k != p and k != q:
+                x, y = m[k][p], m[k][q]
+                m[k][p] = cosine * x - sine * y
+                m[p][k] = m[k][p]
+                m[k][q] = sine * x + cosine * y
+                m[q][k] = m[k][q]
+    eigenvalues[0] = m[0][0]
+    eigenvalues[1] = m[1][1]
+    eigenvalues[2] = m[2][2]
+
+
+def _symmetric_eigenvalues_3d(const np_floats[:, ::1] components):
+    """Eigenvalues of a finite real 3D tensor batch, in ascending order.
+
+    The six columns contain M00, M01, M02, M11, M12, M22. Scaling prevents
+    overflow in the cubic invariants. Centering before squaring avoids loss
+    of the traceless part near a multiple of the identity. Near repeated or
+    zero roots, Jacobi rotations replace the sensitive trigonometric solve.
+    """
+    cdef Py_ssize_t i, n = components.shape[0]
+    cdef double a, b, c, d, e, f, scale, mean, x, y, z, p, r, phi, tmp
+    cdef double eigenvalues[3]
+    cdef int j
+    if components.shape[1] != 6:
+        raise ValueError("Expected six upper-triangle tensor components.")
+    if np_floats is cnp.float32_t:
+        dtype = np.float32
+    else:
+        dtype = np.float64
+    cdef np_floats[:, ::1] output = np.empty((n, 3), dtype=dtype)
+    with nogil:
+        for i in range(n):
+            a, d, f = components[i, 0], components[i, 1], components[i, 2]
+            b, e, c = components[i, 3], components[i, 4], components[i, 5]
+            scale = max(fabs(a), fabs(b), fabs(c), fabs(d), fabs(e), fabs(f))
+            if d == 0 and e == 0 and f == 0:
+                eigenvalues[0], eigenvalues[1], eigenvalues[2] = a, b, c
+            else:
+                a /= scale
+                b /= scale
+                c /= scale
+                d /= scale
+                e /= scale
+                f /= scale
+                mean = (a + b + c) / 3
+                x, y, z = a - mean, b - mean, c - mean
+                p = sqrt((x*x + y*y + z*z + 2*(d*d + e*e + f*f)) / 6)
+                if p == 0:
+                    _symmetric_3x3_jacobi(a, b, c, d, e, f, eigenvalues)
+                else:
+                    x /= p
+                    y /= p
+                    z /= p
+                    r = (x*y*z + 2*(d/p)*(e/p)*(f/p)
+                         - x*(e/p)*(e/p) - y*(f/p)*(f/p)
+                         - z*(d/p)*(d/p)) * 0.5
+                    if fabs(r) > 0.999:
+                        _symmetric_3x3_jacobi(a, b, c, d, e, f, eigenvalues)
+                    else:
+                        phi = acos(r) / 3
+                        eigenvalues[2] = mean + 2*p*cos(phi)
+                        eigenvalues[0] = mean + 2*p*cos(phi + 2.0943951023931954923)
+                        eigenvalues[1] = 3*mean - eigenvalues[0] - eigenvalues[2]
+                        if min(fabs(eigenvalues[0]), fabs(eigenvalues[1]),
+                               fabs(eigenvalues[2])) < 1e-6:
+                            _symmetric_3x3_jacobi(a, b, c, d, e, f, eigenvalues)
+                for j in range(3):
+                    eigenvalues[j] *= scale
+            if eigenvalues[0] > eigenvalues[1]:
+                tmp = eigenvalues[0]
+                eigenvalues[0] = eigenvalues[1]
+                eigenvalues[1] = tmp
+            if eigenvalues[1] > eigenvalues[2]:
+                tmp = eigenvalues[1]
+                eigenvalues[1] = eigenvalues[2]
+                eigenvalues[2] = tmp
+            if eigenvalues[0] > eigenvalues[1]:
+                tmp = eigenvalues[0]
+                eigenvalues[0] = eigenvalues[1]
+                eigenvalues[1] = tmp
+            for j in range(3):
+                output[i, j] = eigenvalues[j]
+    return np.asarray(output)
 
 
 def _corner_moravec(np_floats[:, ::1] cimage, Py_ssize_t window_size=1):

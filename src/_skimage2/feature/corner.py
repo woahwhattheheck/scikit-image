@@ -11,7 +11,10 @@ from _skimage2._shared.utils import _supported_float_type, safe_as_int, warn
 from ..transform.integral import integral_image
 from ..util import img_as_float
 from ._hessian_det_appx import _hessian_matrix_det
-from .corner_cy import _corner_fast, _corner_moravec, _corner_orientations
+from .corner_cy import (
+    _corner_fast, _corner_moravec, _corner_orientations,
+    _symmetric_eigenvalues_3d,
+)
 from .util import _prepare_grayscale_input_2D, _prepare_grayscale_input_nD
 
 
@@ -413,11 +416,74 @@ def _symmetric_compute_eigenvalues(S_elems):
         eigs[1] -= hsqrtdet
         return eigs
     else:
-        matrices = _symmetric_image(S_elems)
-        # eigvalsh returns eigenvalues in increasing order. We want decreasing
-        eigs = np.linalg.eigvalsh(matrices)[..., ::-1]
-        leading_axes = tuple(range(eigs.ndim - 1))
-        return np.transpose(eigs, (eigs.ndim - 1,) + leading_axes)
+        return _symmetric_eigenvalues_batched(S_elems)
+
+
+def _symmetric_eigenvalues_batched(S_elems):
+    """Diagonalize symmetric image tensors with bounded temporary storage.
+
+    A tensor belongs to one pixel, so independent batches need no overlap.
+    Buffering the component arrays also handles strided inputs without making
+    full-image contiguous copies. The 8 MiB budget covers the explicit input,
+    matrix and eigenvalue buffers; LAPACK may use additional batch-sized work.
+    """
+    image = S_elems[0]
+    ndim = image.ndim
+    dtype = image.dtype
+    indices = list(combinations_with_replacement(range(ndim), 2))
+    S_elems = [S_elems[i] for i in range(len(indices))]
+    # Preserve NumPy's eigenvalue output dtype and unsupported-dtype errors.
+    eig_dtype = np.linalg.eigvalsh(np.empty((0, ndim, ndim), dtype=dtype)).dtype
+    eigs = np.empty((ndim, *image.shape), dtype=eig_dtype)
+    if image.size == 0 or ndim == 0:
+        return eigs
+
+    use_3d = ndim == 3 and dtype in (np.dtype('float32'), np.dtype('float64'))
+    bytes_per_pixel = dtype.itemsize * (len(indices) + ndim * ndim)
+    if use_3d:
+        bytes_per_pixel += dtype.itemsize * len(indices)
+    bytes_per_pixel += eig_dtype.itemsize * ndim
+    batch_size = max(1, (8 * 1024**2) // bytes_per_pixel)
+    batch_size = min(image.size, batch_size)
+    if use_3d:
+        packed = np.empty((batch_size, 6), dtype=dtype)
+        matrices = None
+    else:
+        matrices = np.empty((batch_size, ndim, ndim), dtype=dtype)
+    # Input assignment to _symmetric_image allowed broadcasting and cast to
+    # the first component's dtype; retain those semantics in the buffers.
+    flat_eigs = eigs.reshape(ndim, image.size)
+    start = 0
+    with np.nditer(
+        S_elems,
+        flags=['external_loop', 'buffered'],
+        op_flags=['readonly'],
+        op_dtypes=[dtype] * len(S_elems),
+        casting='unsafe',
+        order='C',
+        itershape=image.shape,
+        buffersize=batch_size,
+    ) as iterator:
+        for components in iterator:
+            if len(S_elems) == 1:
+                components = (components,)
+            count = components[0].size
+            if use_3d:
+                for col, values in enumerate(components):
+                    packed[:count, col] = values
+            if use_3d and np.isfinite(packed[:count]).all():
+                values = _symmetric_eigenvalues_3d(packed[:count])
+            else:
+                if matrices is None:
+                    matrices = np.empty((batch_size, ndim, ndim), dtype=dtype)
+                batch = matrices[:count]
+                for values, (row, col) in zip(components, indices):
+                    batch[:, col, row] = values
+                    batch[:, row, col] = values
+                values = np.linalg.eigvalsh(batch)
+            flat_eigs[:, start : start + count] = values[:, ::-1].T
+            start += count
+    return eigs
 
 
 def _symmetric_image(S_elems):
