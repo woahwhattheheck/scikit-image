@@ -19,6 +19,52 @@ def _offsets_diamond(ndim):
     return offsets
 
 
+def _reduce_hull_points(coords):
+    """Discard interior points without requiring full-dimensional input.
+
+    Pixel offsets are added *after* this optional reduction. They give even
+    a single pixel a full-dimensional extent, so a flat set of pixel centers
+    is not an error. Dropping constant axes is exact; if the remaining points
+    are still affinely dependent, keep them all for the final hull instead.
+    """
+    varying = np.ptp(coords, axis=0) != 0
+    reduced = coords if np.all(varying) else coords[:, varying]
+    if reduced.shape[1] == 0:
+        return coords[:1]
+    if reduced.shape[1] == 1:
+        values = reduced[:, 0]
+        return coords[[np.argmin(values), np.argmax(values)]]
+    try:
+        hull = ConvexHull(reduced)
+    except QhullError:
+        return coords
+    return coords[hull.vertices]
+
+
+def _grid_in_hull(shape, hull_equations, tolerance):
+    """Classify grid points with bounded temporary memory.
+
+    Store coordinates as float64 once per block, avoiding both the full
+    integer coordinate grid and its repeated conversion by each dot product.
+    The output is the only allocation proportional to the image volume.
+    """
+    size = int(np.prod(shape))
+    inside = np.empty(size, dtype=bool)
+    # Bound coordinate and classification workspace independently of volume.
+    block_size = 65536
+    for start in range(0, size, block_size):
+        stop = min(start + block_size, size)
+        indices = np.arange(start, stop, dtype=np.intp)
+        coords = np.empty((len(shape), stop - start), dtype=np.float64)
+        for axis in range(len(shape) - 1, -1, -1):
+            coords[axis] = indices % shape[axis]
+            indices //= shape[axis]
+        inside[start:stop] = _check_coords_in_hull(
+            coords, hull_equations, tolerance
+        )
+    return inside.reshape(shape)
+
+
 def _check_coords_in_hull(gridcoords, hull_equations, tolerance):
     r"""Checks all the coordinates for inclusiveness in the convex hull.
 
@@ -122,16 +168,7 @@ def convex_hull_image(
             # when offsetting, we multiply number of vertices by 2 * ndim.
             # therefore, we reduce the number of coordinates by using a
             # convex hull on the original set, before offsetting.
-            try:
-                hull0 = ConvexHull(coords)
-            except QhullError as err:
-                warn(
-                    f"Failed to get convex hull image. "
-                    f"Returning empty image, see error message below:\n"
-                    f"{err}"
-                )
-                return np.zeros(image.shape, dtype=bool)
-            coords = hull0.points[hull0.vertices]
+            coords = _reduce_hull_points(coords)
 
     # Add a vertex for the middle of each pixel edge
     if offset_coordinates:
@@ -161,10 +198,7 @@ def convex_hull_image(
         # points (3) in the mask, otherwise only the inside of the hull (1)
         mask = labels >= 1 if include_borders else labels == 1
     else:
-        gridcoords = np.reshape(np.mgrid[tuple(map(slice, image.shape))], (ndim, -1))
-
-        coords_in_hull = _check_coords_in_hull(gridcoords, hull.equations, tolerance)
-        mask = np.reshape(coords_in_hull, image.shape)
+        mask = _grid_in_hull(image.shape, hull.equations, tolerance)
 
     return mask
 
